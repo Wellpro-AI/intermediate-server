@@ -1,0 +1,117 @@
+name: Build and Push to Dev Docker Registry
+
+on:
+  push:
+    branches:
+      - stage
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    env:
+      GOOGLE_PROJECT_ID: ${{ secrets.GOOGLE_PROJECT_ID }}
+      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+      REGION: "us-east1"
+      APP_NAME: "intermediate-server"
+      STAGE_DOCKER_REGISTRY: "us-east1-docker.pkg.dev/${{ secrets.GOOGLE_PROJECT_ID }}/wellpro-ai-services-stage"
+      HELM_REPO: "https://x-access-token:${{ secrets.GH_PAT }}@github.com/Wellpro-AI/wellpro-helm.git"
+
+    steps:
+      - name: Notify Slack - Workflow Started
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data '{
+            "text": "🚀 *GitHub Actions Workflow Started* for *${{ github.repository }}*\n📌 *Branch:* `${{ github.ref_name }}`\n🔄 *Commit:* `${{ github.sha }}`\n📝 *Message:* `${{ github.event.head_commit.message }}`\n👤 *Pushed by:* `${{ github.actor }}"` 
+          }' ${{ secrets.SLACK_WEBHOOK_URL }}
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Authenticate with Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ env.GCP_SA_KEY }}
+
+      - name: Set Image Name
+        run: |
+          BRANCH_NAME=$(echo "${{ github.ref_name }}" | sed 's/\//-/g')
+          COMMIT_SHA=${{ github.sha }}
+          IMAGE_NAME="${BRANCH_NAME}-${COMMIT_SHA}"
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_ENV
+      - name: Configure Docker
+        run: |
+          gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+      - name: Notify Slack - Building Docker Image
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data '{
+            "text": "🐳 *Building Docker Image* for `${{ env.APP_NAME }}`..."
+          }' ${{ secrets.SLACK_WEBHOOK_URL }}
+      - name: Build Docker Image
+        run: |
+          docker build -t ${{ env.STAGE_DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.IMAGE_NAME }} .
+      - name: Notify Slack - Docker Image Built
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data '{
+            "text": "✅ *Docker Image Built Successfully!* 🚀\n📦 *Image:* `${{ env.IMAGE_NAME }}`"
+          }' ${{ secrets.SLACK_WEBHOOK_URL }}
+      - name: Install Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget
+          wget https://github.com/aquasecurity/trivy/releases/download/v0.32.0/trivy_0.32.0_Linux-64bit.deb
+          sudo dpkg -i trivy_0.32.0_Linux-64bit.deb
+      - name: Download Trivy HTML Template
+        run: |
+          sudo wget -O /usr/bin/html.tpl https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/html.tpl
+          sudo chmod 644 /usr/bin/html.tpl
+      - name: Run Trivy Scan
+        run: |
+          trivy image --format json --output /tmp/${{ env.IMAGE_NAME }}.json ${{ env.STAGE_DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.IMAGE_NAME }}
+          trivy image --format template --template "@/usr/bin/html.tpl" -o /tmp/${{ env.IMAGE_NAME }}.html ${{ env.STAGE_DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.IMAGE_NAME }}
+      - name: Upload Trivy Report to GCS
+        run: |
+          gsutil cp /tmp/${{ env.IMAGE_NAME }}.html gs://trivy-reports-wellpro/${{ env.IMAGE_NAME }}.html
+      - name: Notify Slack - Trivy Scan Complete
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data '{
+            "text": "✅ *Trivy Scan Completed!* Report uploaded: https://storage.googleapis.com/trivy-reports-wellpro/${{ env.IMAGE_NAME }}.html"
+          }' ${{ secrets.SLACK_WEBHOOK_URL }}
+      - name: Push Docker Image
+        run: |
+          docker push ${{ env.STAGE_DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.IMAGE_NAME }}
+      - name: Notify Slack - Pushed Docker Image
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data '{
+            "text": "📤 *Docker Image Pushed:* `${{ env.STAGE_DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.IMAGE_NAME }}`"
+          }' ${{ secrets.SLACK_WEBHOOK_URL }}
+      - name: Clone Helm Repository
+        run: |
+          git clone ${{ env.HELM_REPO }} helm-repo
+          cd helm-repo
+          git checkout ai-helm
+      - name: Update Helm values.yaml
+        run: |
+          cd helm-repo/stage/intermediate-server
+          NEW_IMAGE="${{ env.STAGE_DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.IMAGE_NAME }}"
+          sed -i '8s|name: .*|name: "'"${NEW_IMAGE}"'"|' values.yaml
+          echo "Updated image to: $NEW_IMAGE"
+          cat values.yaml
+      - name: Commit and Push Helm Update
+        run: |
+          cd helm-repo
+          git config --global user.email "bot@github.com"
+          git config --global user.name "GitHub Actions Bot"
+          git add stage/intermediate-server/values.yaml
+          git commit -m "Updated image to ${{ env.IMAGE_NAME }} [CI/CD]"
+          git push origin ai-helm
+      - name: Notify Slack - Workflow Success
+        if: success()
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data '{
+            "text": "🍻 *Workflow Succeeded!* ✅"
+          }' ${{ secrets.SLACK_WEBHOOK_URL }}
+      - name: Notify Slack - Workflow Failure
+        if: failure()
+        run: |
+          curl -X POST -H 'Content-type: application/json' --data '{
+            "text": "🚨 *Workflow Failed!* ❌ Check logs for details."
+          }' ${{ secrets.SLACK_WEBHOOK_URL }}
