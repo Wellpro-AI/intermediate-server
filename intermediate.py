@@ -13,17 +13,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("intermediate")
 
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Consider restricting in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-db = firestore.AsyncClient(database="transcriber-session-v1")
+# Firestore client (singleton)
+db = firestore.AsyncClient()
 FIRESTORE_COLLECTION = "session"
-
 active_sessions = {}
 
 def format_time(seconds: float) -> str:
@@ -32,33 +33,22 @@ def format_time(seconds: float) -> str:
 async def delete_session(session_id: str):
     """Delete session from memory and Firestore"""
     try:
-        if session_id in active_sessions:
-            # Close all connections
-            session = active_sessions[session_id]
+        session = active_sessions.pop(session_id, None)
+        if session:
             for conn in session["transcription_conns"].values():
                 await conn.close()
-            
-            # Delete from Firestore
-            session_ref = db.collection(FIRESTORE_COLLECTION).document(session_id)
-            await session_ref.delete()
-            logger.info(f"Deleted session {session_id} from Firestore")
-            
-            # Remove from memory
-            del active_sessions[session_id]
-            logger.info(f"Removed session {session_id} from memory")
-            
+
+            await db.collection(FIRESTORE_COLLECTION).document(session_id).delete()
+            logger.info(f"Deleted session {session_id} from Firestore and memory")
     except NotFound:
         logger.warning(f"Session {session_id} not found in Firestore")
     except Exception as e:
         logger.error(f"Error deleting session {session_id}: {e}")
 
 async def schedule_session_deletion(session_id: str):
-    """Schedule session deletion after 15 minutes of inactivity"""
-    await asyncio.sleep(900)  # 15 minutes
-    
+    await asyncio.sleep(900)  # 15 min
     if session_id in active_sessions:
         session = active_sessions[session_id]
-        # Check if still has inactive roles
         if session.get("inactive_roles"):
             logger.info(f"Deleting inactive session {session_id}")
             await delete_session(session_id)
@@ -69,32 +59,35 @@ async def ping_client(session_id: str, client: WebSocket):
             await client.send_text(json.dumps({"type": "ping"}))
             await asyncio.sleep(25)
     except Exception as e:
-        logger.error(f"Ping error for session {session_id}: {e}")
+        logger.warning(f"Ping stopped for session {session_id}: {e}")
 
 async def connect_to_transcription(session_id: str, role: str):
+    transcription_url = os.getenv("TRANS_URL")
+    if not transcription_url:
+        logger.error("TRANS_URL not set in environment")
+        return None
     try:
-        transcription_url = os.getenv("TRANS_URL")
-        ws = await websockets.connect(transcription_url)
-        logger.info(f"Created transcription connection for {role} in session {session_id}")
+        ws = await asyncio.wait_for(websockets.connect(transcription_url), timeout=10)
+        logger.info(f"Transcription connection created for {role} in session {session_id}")
         return ws
     except Exception as e:
-        logger.error(f"Transcription connection failed: {e}")
+        logger.error(f"Failed to connect to transcription service: {e}")
         return None
 
 async def update_conversation_firestore(session_id: str, line: str):
     try:
-        session_ref = db.collection(FIRESTORE_COLLECTION).document(session_id)
-        await session_ref.update({
+        await db.collection(FIRESTORE_COLLECTION).document(session_id).update({
             "conversation": firestore.ArrayUnion([line])
         })
     except Exception as e:
-        logger.error(f"Error updating Firestore for session {session_id}: {e}")
+        logger.error(f"Error updating Firestore for {session_id}: {e}")
 
 async def transcription_listener(session_id: str, role: str):
     session = active_sessions.get(session_id)
-    if not session or role not in session["transcription_conns"]:
+    ws = session["transcription_conns"].get(role)
+    if not session or not ws:
         return
-    ws = session["transcription_conns"][role]
+
     try:
         async for message in ws:
             try:
@@ -104,25 +97,28 @@ async def transcription_listener(session_id: str, role: str):
             except Exception:
                 transcript = message
                 is_final = True
+
             elapsed = time.time() - session["start_time"]
             formatted_line = f"{format_time(elapsed)} - {role.capitalize()}: {transcript}"
             session["conversation"].append(formatted_line)
             await update_conversation_firestore(session_id, formatted_line)
-            
+
             payload = json.dumps({
                 "type": "transcript",
                 "data": formatted_line,
                 "sessionId": session_id,
                 "is_final": is_final
             })
-            
+
+            # Broadcast to all clients
             for client in list(session["clients"].keys()):
                 try:
                     await client.send_text(payload)
                 except Exception as e:
-                    logger.error(f"Error sending to client: {e}")
+                    logger.warning(f"Client send failed: {e}")
+
     except Exception as e:
-        logger.error(f"Transcription listener error for session {session_id}: {e}")
+        logger.error(f"Listener error for {session_id}-{role}: {e}")
     finally:
         await ws.close()
 
@@ -131,15 +127,17 @@ async def room_endpoint(websocket: WebSocket):
     await websocket.accept()
     session_id = None
     role = None
+
     try:
         init_data = await websocket.receive_json()
-        session_id = init_data["sessionId"]
-        role = init_data["role"]
+        session_id = init_data.get("sessionId")
+        role = init_data.get("role")
+
         if not session_id or not role:
             await websocket.close(code=4000)
             return
-        
-        # Initialize Firestore session document if new
+
+        # Ensure Firestore session document exists
         session_ref = db.collection(FIRESTORE_COLLECTION).document(session_id)
         doc = await session_ref.get()
         if not doc.exists:
@@ -147,90 +145,74 @@ async def room_endpoint(websocket: WebSocket):
                 "start_time": time.time(),
                 "conversation": []
             })
-        
-        # Initialize in-memory session mapping if not present
-        if session_id not in active_sessions:
-            active_sessions[session_id] = {
-                "clients": {},
-                "transcription_conns": {},
-                "conversation": [],
-                "start_time": time.time(),
-                "inactive_roles": {},
-                "deletion_task": None
-            }
-        
-        session = active_sessions[session_id]
-        
-        # Cancel pending deletion if reconnecting
+
+        # Initialize in-memory session if not present
+        session = active_sessions.setdefault(session_id, {
+            "clients": {},
+            "transcription_conns": {},
+            "conversation": [],
+            "start_time": time.time(),
+            "inactive_roles": {},
+            "deletion_task": None
+        })
+
+        # Cancel deletion if reconnecting
         if role in session["inactive_roles"]:
             del session["inactive_roles"][role]
             if session["deletion_task"] and not session["deletion_task"].done():
                 session["deletion_task"].cancel()
                 session["deletion_task"] = None
-                logger.info(f"Cancelled deletion task for {session_id}")
+                logger.info(f"Cancelled deletion for {session_id}")
 
-        # Create role-specific Deepgram connection if needed
+        # Create transcription connection if missing
         if role not in session["transcription_conns"]:
-            dg_ws = await connect_to_transcription(session_id, role)
-            if dg_ws:
-                session["transcription_conns"][role] = dg_ws
+            ws = await connect_to_transcription(session_id, role)
+            if ws:
+                session["transcription_conns"][role] = ws
                 asyncio.create_task(transcription_listener(session_id, role))
-        
-        # Register client
+
+        # Add client
         session["clients"][websocket] = role
         asyncio.create_task(ping_client(session_id, websocket))
-        
-        # Send conversation history from Firestore
+
+        # Send past conversation
         doc = await session_ref.get()
-        session_data = doc.to_dict()
-        if session_data and session_data.get("conversation"):
+        convo = doc.to_dict().get("conversation", [])
+        if convo:
             await websocket.send_text(json.dumps({
                 "type": "transcript",
-                "data": "\n".join(session_data["conversation"]),
+                "data": "\n".join(convo),
                 "sessionId": session_id
             }))
-        
-        # Audio forwarding loop
+
+        # Forward audio
         while True:
             audio_data = await websocket.receive_bytes()
             if role in session["transcription_conns"]:
                 await session["transcription_conns"][role].send(audio_data)
-    
+
     except WebSocketDisconnect:
-        logger.info(f"Client disconnected from session {session_id}")
+        logger.info(f"WebSocket disconnected: {session_id}, role={role}")
     except Exception as e:
-        logger.error(f"Connection error: {e}")
+        logger.error(f"Unhandled error in /ws/room: {e}")
     finally:
-        if session_id and session_id in active_sessions:
+        if session_id in active_sessions:
             session = active_sessions[session_id]
             session["clients"].pop(websocket, None)
-            
-            # Check if role became inactive
-            role_clients = [c for c, r in session["clients"].items() if r == role]
-            if not role_clients:
-                # Close transcription connection
+
+            # Role inactive
+            if role and not any(r == role for r in session["clients"].values()):
                 if role in session["transcription_conns"]:
                     await session["transcription_conns"][role].close()
                     del session["transcription_conns"][role]
-                
-                # Track inactive role
                 session["inactive_roles"][role] = time.time()
-                logger.info(f"Marked {role} as inactive in {session_id}")
-                
-                # Immediate cleanup if both roles inactive
-                if len(session["inactive_roles"]) >= 2:
-                    logger.info(f"All roles inactive - deleting {session_id}")
-                    await delete_session(session_id)
-                else:
-                    # Schedule cleanup after 15 minutes
-                    if not session["deletion_task"]:
-                        session["deletion_task"] = asyncio.create_task(schedule_session_deletion(session_id))
-                        logger.info(f"Scheduled deletion for {session_id} in 15m")
-            
-            # Cleanup if no clients left
+
+            # Delete if all roles inactive
+            if len(session["inactive_roles"]) >= 2:
+                await delete_session(session_id)
+            elif not session["deletion_task"]:
+                session["deletion_task"] = asyncio.create_task(schedule_session_deletion(session_id))
+
+            # Delete if no clients
             if not session["clients"]:
                 await delete_session(session_id)
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
