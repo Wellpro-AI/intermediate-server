@@ -1,18 +1,22 @@
 # Use the official lightweight Python image
-FROM python:3.11
+FROM python:3.11-slim
 
-# Set the working directory inside the container
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Set working directory
 WORKDIR /app
 
-# Copy requirements and install dependencies
+# Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the application files
+# Copy app code
 COPY . .
 
-# Expose the required port
+# Expose FastAPI port
 EXPOSE 8080
 
-# Start the FastAPI application using Uvicorn
-CMD ["uvicorn", "intermediate:app", "--host", "0.0.0.0", "--port", "8080"]
+# Run the app using uvicorn with proxy headers support
+CMD ["uvicorn", "intermediate:app", "--host", "0.0.0.0", "--port", "8080", "--proxy-headers", "--forwarded-allow-ips=*"]
